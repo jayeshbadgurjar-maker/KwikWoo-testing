@@ -139,6 +139,11 @@ class GokwikCart
                 'callback' => 'updateOrderStatus'
             ],
             [
+                'route' => '/' . $this->rest_base . '/update-order',
+                'methods' => WP_REST_Server::CREATABLE,
+                'callback' => 'updateOrder'
+            ],
+            [
                 'route' => '/' . $this->rest_base . '/process-refund',
                 'methods' => WP_REST_Server::CREATABLE,
                 'callback' => 'refundProcess',
@@ -1888,6 +1893,286 @@ class GokwikCart
     }
 
     /**
+     * Update a placed GoKwik order, one key at a time.
+     *
+     * Each update is a key-value pair, so a field decided later is a new key. Every key is answered
+     * applied, unchanged, unsupported or rejected; keys prefixed gokwik_ are stored as order meta.
+     * The order is found by gokwik_order_id: place-order returns the custom order number when
+     * "Custom Order Numbers" is active, so merchant_order_id is only a cross-check.
+     *
+     * @param WP_REST_Request $request
+     *
+     * @return WP_REST_Response|WP_Error
+     * @since 1.2.3
+     */
+    public function updateOrder($request)
+    {
+        if (class_exists('WC_Logger')) {
+            $logger = wc_get_logger();
+            $context = array('source' => 'gokwik_cart_update_order');
+            $logger->info('Request body: ' . wp_json_encode($request->get_params()), $context);
+        }
+
+        $gokwik_order_id = wc_clean(wp_unslash($request->get_param('gokwik_order_id')));
+        $merchant_order_id = wc_clean(wp_unslash($request->get_param('merchant_order_id')));
+        $updates = wc_clean(wp_unslash($request->get_param('updates')));
+        $updates = is_array($updates) ? $updates : [];
+
+        if (empty($gokwik_order_id) || empty($updates)) {
+            return new WP_Error(
+                'gc_missing_required_parameters',
+                'Missing required parameters.',
+                ['status' => 400]
+            );
+        }
+
+        $keys = array_map(function ($update) {
+            return is_array($update) ? (string) ($update['key'] ?? '') : '';
+        }, $updates);
+        if (in_array('', $keys, true) || count(array_unique($keys)) !== count($keys)) {
+            return new WP_Error(
+                'gc_invalid_updates',
+                'Every update needs a key, and each key only once.',
+                ['status' => 400]
+            );
+        }
+
+        // meta_key/meta_value, not meta_query: on the posts storage (HPOS off) wc_get_orders drops
+        // meta_query, so the lookup would return the store's latest order instead of this one.
+        $args = [
+            'limit' => 1,
+            'type' => 'shop_order',
+            'meta_key' => 'gokwik_order_id',
+            'meta_value' => sanitize_text_field($gokwik_order_id),
+        ];
+
+        $order = wc_get_orders($args);
+        $order = !empty($order) ? reset($order) : null;
+        if (!$order) {
+            return new WP_REST_Response(['message' => 'Order not found.'], 404);
+        }
+
+        if ($order->get_meta('is_gokwik_order', true) != 'true') {
+            return new WP_Error(
+                'gc_invalid_order',
+                'The order is not a GoKwik order.',
+                ['status' => 400]
+            );
+        }
+
+        $orderId = $order->get_id();
+        if (is_plugin_active('custom-order-numbers-for-woocommerce/custom-order-numbers-for-woocommerce.php')) {
+            $orderId = $order->get_meta('_alg_wc_full_custom_order_number');
+        }
+
+        if (!empty($merchant_order_id) && $merchant_order_id != $order->get_id() && $merchant_order_id != $orderId) {
+            return new WP_Error(
+                'gc_order_mismatch',
+                'The order does not match merchant_order_id.',
+                ['status' => 400]
+            );
+        }
+
+        // Keeps the answers in request order.
+        $results = array_fill_keys($keys, null);
+
+        if (in_array($order->get_status(), ['cancelled', 'refunded', 'failed', 'trash'], true)) {
+            foreach ($keys as $key) {
+                $results[$key] = [
+                    'status' => 'rejected',
+                    'message' => sprintf('The store order is %s.', $order->get_status()),
+                ];
+            }
+        } else {
+            $order_note = null;
+            foreach ($updates as $update) {
+                $key = (string) $update['key'];
+                $value = $update['value'] ?? null;
+
+                switch ($key) {
+                    case 'payment_mode':
+                        $results[$key] = $this->updateOrderPaymentMode($order, $value);
+                        break;
+                    case 'amount_due':
+                        $results[$key] = $this->updateOrderAmountDue($order, $value);
+                        break;
+                    case 'payment':
+                        $results[$key] = $this->updateOrderPayment($order, $value);
+                        break;
+                    case 'order_note':
+                        // Written only if another key changed the order, so answered after the loop.
+                        $order_note = sanitize_text_field((string) $value);
+                        break;
+                    default:
+                        $results[$key] = strpos($key, 'gokwik_') === 0
+                            ? $this->updateOrderMeta($order, $key, $value)
+                            : ['status' => 'unsupported'];
+                }
+            }
+
+            $applied = in_array('applied', array_column(array_filter($results), 'status'), true);
+            if ($applied) {
+                $order->save();
+                if (($results['amount_due']['status'] ?? null) === 'applied' && function_exists('wc_update_order_stats')) {
+                    wc_update_order_stats($order->get_id());
+                }
+            }
+
+            if (array_key_exists('order_note', $results)) {
+                if ($applied && $order_note !== '') {
+                    $order->add_order_note($order_note);
+                    $results['order_note'] = ['status' => 'applied'];
+                } else {
+                    $results['order_note'] = ['status' => 'unchanged'];
+                }
+            }
+        }
+
+        $response = [
+            'order_id' => $orderId,
+            'status' => $order->get_status(),
+            'total' => $order->get_total(),
+            'results' => array_map(function ($key) use ($results) {
+                return array_merge(['key' => $key], $results[$key]);
+            }, $keys),
+        ];
+
+        if (isset($logger)) {
+            $logger->info('Response: ' . wp_json_encode($response), $context);
+        }
+
+        return new WP_REST_Response($response, 200);
+    }
+
+    /**
+     * payment_mode: only "prepaid", the order no longer being cash on delivery.
+     *
+     * @param WC_Order $order
+     * @param mixed $value
+     * @return array
+     * @since 1.2.3
+     */
+    protected function updateOrderPaymentMode($order, $value)
+    {
+        if ($value !== 'prepaid') {
+            return ['status' => 'unsupported'];
+        }
+
+        if ($order->get_payment_method() === 'gokwik_prepaid') {
+            return ['status' => 'unchanged'];
+        }
+
+        $payment_gateways = WC()->payment_gateways()->payment_gateways();
+        if (!isset($payment_gateways['gokwik_prepaid'])) {
+            return ['status' => 'rejected', 'message' => 'The GoKwik Prepaid gateway is not available.'];
+        }
+
+        // As place-order sets it, so the title is the gateway's, like any GoKwik prepaid order.
+        $order->set_payment_method($payment_gateways['gokwik_prepaid']);
+
+        return ['status' => 'applied'];
+    }
+
+    /**
+     * amount_due: only 0, nothing left to collect on delivery.
+     *
+     * Place-order turns a PP-COD order's advance_paid into a negative "Advance Payment" fee, so the
+     * order total is only the balance. Once the balance is paid the fee is removed and the total
+     * restored to what was collected, without calculate_totals(), which would redo the coupons and
+     * fees place-order set by hand. The fee carries no tax (tax status none).
+     *
+     * @param WC_Order $order
+     * @param mixed $value
+     * @return array
+     * @since 1.2.3
+     */
+    protected function updateOrderAmountDue($order, $value)
+    {
+        if (!is_numeric($value) || (float) $value != 0) {
+            return ['status' => 'unsupported'];
+        }
+
+        $changed = false;
+        $advance_fee_name = sprintf(__('Discount (%s)', 'gokwik'), __('Advance Payment', 'gokwik'));
+        foreach ($order->get_items('fee') as $item_id => $fee) {
+            if ($fee->get_name() !== $advance_fee_name) {
+                continue;
+            }
+
+            $order->set_total(wc_format_decimal((float) $order->get_total() - (float) $fee->get_total(), wc_get_price_decimals()));
+            $order->remove_item($item_id);
+            $changed = true;
+        }
+
+        $due_amount = $order->get_meta('due_amount', true);
+        if ($due_amount !== '' && (float) $due_amount != 0) {
+            $order->update_meta_data('due_amount', 0);
+            $changed = true;
+        }
+
+        return ['status' => $changed ? 'applied' : 'unchanged'];
+    }
+
+    /**
+     * payment: a payment collected after placement, e.g. a payment link's.
+     *
+     * The link fields let the refund webhook find the order and accept its payment id.
+     *
+     * @param WC_Order $order
+     * @param mixed $value {payment_id, amount, method, reference, paid_at}
+     * @return array
+     * @since 1.2.3
+     */
+    protected function updateOrderPayment($order, $value)
+    {
+        $payment_id = is_array($value) ? (string) ($value['payment_id'] ?? '') : '';
+        $reference = is_array($value) ? (string) ($value['reference'] ?? '') : '';
+        if ($payment_id === '' || $reference === '') {
+            return ['status' => 'rejected', 'message' => 'payment_id and reference are required.'];
+        }
+
+        if ($order->get_meta('gokwik_payment_link_payment_id', true) === $payment_id) {
+            return ['status' => 'unchanged'];
+        }
+
+        $order->update_meta_data('gokwik_payment_link_ref', $reference);
+        $order->update_meta_data('gokwik_payment_link_payment_id', $payment_id);
+        $order->update_meta_data('gokwik_payment_link_amount', $value['amount'] ?? '');
+        $order->update_meta_data('gokwik_payment_link_method', $value['method'] ?? '');
+
+        if (!$order->get_date_paid()) {
+            $order->set_date_paid(!empty($value['paid_at']) ? $value['paid_at'] : time());
+        }
+
+        // A COD order took no token payment, so the link payment is its transaction.
+        if (!$order->get_transaction_id()) {
+            $order->set_transaction_id($payment_id);
+        }
+
+        return ['status' => 'applied'];
+    }
+
+    /**
+     * gokwik_* keys: stored as order meta as given, for fields not decided yet.
+     *
+     * @param WC_Order $order
+     * @param string $key
+     * @param mixed $value
+     * @return array
+     * @since 1.2.3
+     */
+    protected function updateOrderMeta($order, $key, $value)
+    {
+        if ($order->get_meta($key, true) == $value) {
+            return ['status' => 'unchanged'];
+        }
+
+        $order->update_meta_data($key, $value);
+
+        return ['status' => 'applied'];
+    }
+
+    /**
      * Refund Process.
      *
      * @param WP_REST_Request $request
@@ -1951,19 +2236,22 @@ class GokwikCart
             );
         }
 
+        // meta_key/meta_value: wc_get_orders drops meta_query on the posts storage (see updateOrder).
         $args = [
             'limit' => 1,
-            'meta_query' => [
-                [
-                    'key' => 'gokwik_order_id',
-                    'value' => sanitize_text_field($merchantReferenceId),
-                    'compare' => '='
-                ]
-            ],
+            'type' => 'shop_order',
+            'meta_key' => 'gokwik_order_id',
+            'meta_value' => sanitize_text_field($merchantReferenceId),
         ];
 
         $order = wc_get_orders($args);
         $order = !empty($order) ? reset($order) : null;
+        if (!$order) {
+            // A payment link's refund is filed under the link's own reference (update-order's payment key).
+            $args['meta_key'] = 'gokwik_payment_link_ref';
+            $order = wc_get_orders($args);
+            $order = !empty($order) ? reset($order) : null;
+        }
         if (!$order) {
             return new WP_Error(
                 'gc_order_not_found',
@@ -1980,7 +2268,13 @@ class GokwikCart
             );
         }
 
-        if ($order->get_transaction_id() && $order->get_transaction_id() != $transactionPaymentId) {
+        // Also the payment link's payment, which update-order's payment key records.
+        $link_payment_id = $order->get_meta('gokwik_payment_link_payment_id', true);
+        if (
+            $order->get_transaction_id()
+            && $order->get_transaction_id() != $transactionPaymentId
+            && ($link_payment_id === '' || $link_payment_id != $transactionPaymentId)
+        ) {
             return new WP_Error(
                 'gc_invalid_transaction',
                 'Invalid Transaction.',
@@ -2021,18 +2315,22 @@ class GokwikCart
         if ($event == "refund.successful") {
             if (!$is_woo_refund) {
                 if ($order->get_total() == ($total_refund + $refund_amount)) {
+                    // This refund completes the order, possibly after earlier partial ones (a payment-link
+                    // order is always refunded in two). Refund this webhook's amount, which is what is left:
+                    // wc_create_refund refuses more than get_remaining_refund_amount(). Restock only the
+                    // quantity no earlier refund restocked; the line total stays 0, as before.
                     $refunded_items = [];
-                    $refund_amount = 0.00;
                     $refund_reason = "Full refund via GoKwik";
                     foreach ($order->get_items() as $item_id => $item) {
-                        $qty = $item->get_quantity();
-                        $total = $item->get_total();
-                    
+                        $qty = $item->get_quantity() - abs($order->get_qty_refunded_for_item($item_id));
+                        if ($qty <= 0) {
+                            continue;
+                        }
+
                         $refunded_items[$item_id] = [
                             'qty' => $qty,
-                            'total' => $total,
+                            'refund_total' => 0,
                         ];
-                        $refund_amount += $total;
                     }
 
                     $refund = wc_create_refund([
