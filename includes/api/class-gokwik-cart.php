@@ -40,6 +40,11 @@ class GokwikCart
     protected static $_instance = null;
 
     /**
+     * WooCommerce log source for update-items (WooCommerce › Status › Logs).
+     */
+    const UPDATE_ITEMS_LOG_SOURCE = 'gokwik-cart-update-items';
+
+    /**
      * Constructor method.
      * Registers the REST API endpoints.
      */
@@ -158,6 +163,11 @@ class GokwikCart
                 'route' => '/' . $this->rest_base . '/fetch-customer-details',
                 'methods' => WP_REST_Server::CREATABLE,
                 'callback' => 'fetchCustomerDetails'
+            ],
+            [
+                'route' => '/' . $this->rest_base . '/update-items',
+                'methods' => WP_REST_Server::CREATABLE,
+                'callback' => 'updateCartItems'
             ]
         ];
 
@@ -2300,7 +2310,7 @@ class GokwikCart
      * @param string $session_key The session key.
      * @param array $wc_session_data The session data to update.
      *
-     * @return void
+     * @return int|false Rows updated, or false on a database error.
      * @since 1.1.3
      */
     protected function updateSessionData($session_key, $wc_session_data)
@@ -2308,7 +2318,7 @@ class GokwikCart
         global $wpdb;
         $sessions_table = $wpdb->prefix . 'woocommerce_sessions';
         $serialized_session = maybe_serialize($wc_session_data);
-        $wpdb->update(
+        return $wpdb->update(
             $sessions_table,
             ['session_value' => $serialized_session],
             ['session_key' => $session_key]
@@ -2398,6 +2408,177 @@ class GokwikCart
         }
         return new WP_REST_Response($response_data, 200);
     }
+    /**
+     * Add or remove cart items for cart upsell (GKP-33866).
+     *
+     * ADD_ITEM and REMOVE_ITEM are handled. checkout-service has already quoted an added item
+     * with checkout-addons-service, so it is added at its catalogue price with no price logic
+     * here; the upsell saving arrives as a negative fee line at place-order. REMOVE_ITEM takes
+     * out an accepted upsell line, and undoes an add that failed after this call. Every line is
+     * checked before the cart changes, so a refused request leaves the cart untouched.
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response|WP_Error
+     */
+    public function updateCartItems($request)
+    {
+        $line_items = $request->get_param('line_items');
+        $session_key = $request->get_param('session_key');
+        $logger = wc_get_logger();
+        $log_context = ['source' => self::UPDATE_ITEMS_LOG_SOURCE];
+        $logger->info('Request received. ' . wp_json_encode(['session_key' => $session_key, 'line_items' => $line_items]), $log_context);
+
+        try {
+            if (empty($line_items) || !is_array($line_items)) {
+                return $this->updateItemsError('INVALID_ACTION', 'line_items is required.', ['status' => 400]);
+            }
+
+            $cartSessionResponse = $this->loadCartSession($session_key);
+            if (is_wp_error($cartSessionResponse)) {
+                $logger->warning('Cart session not loaded: ' . $cartSessionResponse->get_error_code() . ' ' . wp_json_encode(['session_key' => $session_key]), $log_context);
+                return $cartSessionResponse;
+            }
+            [$wc_session_data, $cartObj] = $cartSessionResponse;
+
+            $items_to_add = [];
+            $keys_to_remove = [];
+            foreach ($line_items as $item) {
+                $error_data = [
+                    'status' => 400,
+                    'failed_item' => [
+                        'product_id' => $item['product_id'] ?? null,
+                        'variant_id' => $item['variant_id'] ?? null,
+                        'action' => $item['action'] ?? null,
+                    ],
+                ];
+
+                $action = $item['action'] ?? '';
+                if (!in_array($action, ['ADD_ITEM', 'REMOVE_ITEM'], true)) {
+                    return $this->updateItemsError('INVALID_ACTION', 'Only ADD_ITEM and REMOVE_ITEM are supported.', $error_data);
+                }
+
+                // Ids are strings end to end (upsell TRD): "01234" and "1234" are different products,
+                // so only a canonical WooCommerce id is accepted rather than coerced.
+                $raw_product_id = (string) ($item['product_id'] ?? '');
+                $raw_variant_id = (string) ($item['variant_id'] ?? '');
+                if (
+                    $raw_product_id !== (string) absint($raw_product_id) ||
+                    ($raw_variant_id !== '' && $raw_variant_id !== (string) absint($raw_variant_id))
+                ) {
+                    return $this->updateItemsError('ITEM_NOT_FOUND', 'Product does not exist.', $error_data);
+                }
+                $product_id = absint($raw_product_id);
+                $variation_id = absint($raw_variant_id);
+                // A simple product can arrive with variant_id equal to product_id.
+                if ($variation_id === $product_id) {
+                    $variation_id = 0;
+                }
+                $cart_item_key = $this->findCartItemKey($cartObj, $product_id, $variation_id);
+
+                if ($action === 'REMOVE_ITEM') {
+                    if (!$cart_item_key) {
+                        return $this->updateItemsError('ITEM_NOT_FOUND', 'Item is not in the cart.', $error_data);
+                    }
+                    $keys_to_remove[] = $cart_item_key;
+                    continue;
+                }
+
+                // Refuse rather than merge: add_to_cart would raise the quantity of the existing line,
+                // and a later undo of this add would then remove the units the shopper already had.
+                if ($cart_item_key) {
+                    return $this->updateItemsError('ITEM_ALREADY_IN_CART', 'Item is already in the cart.', $error_data);
+                }
+                $quantity = isset($item['quantity']) ? max(1, intval($item['quantity'])) : 1;
+
+                $product = $variation_id ? wc_get_product($variation_id) : wc_get_product($product_id);
+                if (!$product) {
+                    return $this->updateItemsError('ITEM_NOT_FOUND', 'Product does not exist.', $error_data);
+                }
+                if ($variation_id ? $product->get_parent_id() !== $product_id : $product->is_type('variable')) {
+                    return $this->updateItemsError('INVALID_VARIANT', 'Variant does not match the product.', $error_data);
+                }
+                if (!$product->is_purchasable() || !$product->is_in_stock() || !$product->has_enough_stock($quantity)) {
+                    return $this->updateItemsError('ITEM_OUT_OF_STOCK', 'Item is out of stock.', $error_data);
+                }
+
+                $items_to_add[] = [$product_id, $quantity, $variation_id, $error_data];
+            }
+
+            foreach ($keys_to_remove as $cart_item_key) {
+                $cartObj->remove_cart_item($cart_item_key);
+            }
+
+            foreach ($items_to_add as [$product_id, $quantity, $variation_id, $error_data]) {
+                if (!$cartObj->add_to_cart($product_id, $quantity, $variation_id)) {
+                    $notices = wc_get_notices('error');
+                    wc_clear_notices();
+                    $message = !empty($notices[0]['notice']) ? wp_strip_all_tags($notices[0]['notice']) : 'Unable to add item to the cart.';
+                    return $this->updateItemsError('INVALID_VARIANT', $message, $error_data);
+                }
+            }
+
+            $wc_session_data['cart'] = maybe_serialize($cartObj->get_cart_for_session());
+            if ($this->updateSessionData($session_key, $wc_session_data) === false) {
+                return $this->updateItemsError('SESSION_SAVE_FAILED', 'Unable to save the cart.', ['status' => 500, 'session_key' => $session_key]);
+            }
+
+            $logger->info('Cart updated. ' . wp_json_encode([
+                'session_key' => $session_key,
+                'added' => count($items_to_add),
+                'removed' => count($keys_to_remove),
+            ]), $log_context);
+            return new WP_REST_Response(
+                [
+                    'status' => 'success',
+                    'message' => 'Cart items updated',
+                ],
+                200
+            );
+        } catch (\Throwable $e) {
+            return $this->updateItemsError('UPDATE_ITEMS_FAILED', 'Unable to update the cart.', [
+                'status' => 500,
+                'session_key' => $session_key,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /**
+     * Log an update-items refusal (400, warning) or failure (500, error) and return it as a WP_Error.
+     *
+     * @param string $code
+     * @param string $message
+     * @param array $data Must carry 'status'; the rest is logged and returned as error data.
+     * @return WP_Error
+     */
+    protected function updateItemsError($code, $message, $data)
+    {
+        $level = ($data['status'] ?? 400) >= 500 ? 'error' : 'warning';
+        wc_get_logger()->log($level, $code . ': ' . $message . ' ' . wp_json_encode($data), ['source' => self::UPDATE_ITEMS_LOG_SOURCE]);
+        return new WP_Error($code, $message, $data);
+    }
+
+    /**
+     * Find the cart line of a product/variation pair.
+     *
+     * @param WC_Cart $cartObj
+     * @param int $product_id
+     * @param int $variation_id 0 for a simple product.
+     * @return string|null The cart item key.
+     */
+    protected function findCartItemKey($cartObj, $product_id, $variation_id)
+    {
+        foreach ($cartObj->get_cart() as $cart_item_key => $cart_item) {
+            if (
+                (int) $cart_item['product_id'] === $product_id &&
+                (int) ($cart_item['variation_id'] ?? 0) === $variation_id
+            ) {
+                return $cart_item_key;
+            }
+        }
+        return null;
+    }
+
 	/**
      * get customer details
      *
